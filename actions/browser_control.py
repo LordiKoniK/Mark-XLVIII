@@ -213,6 +213,68 @@ def _find_exe_windows(prog_name: str) -> Optional[str]:
         pass
     return None
 
+
+def _is_windows_process_running(image_names: list[str]) -> bool:
+    """
+    Best-effort check for running processes on Windows.
+    Used to avoid launching Chromium with a locked real profile.
+    """
+    if _OS != "Windows":
+        return False
+
+    for image in image_names:
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {image}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            out = (proc.stdout or "").lower()
+            if image.lower() in out:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _terminate_windows_processes(image_names: list[str]) -> int:
+    """
+    Force-close running browser processes so the real profile lock is released.
+    Returns number of process image names successfully terminated.
+    """
+    if _OS != "Windows":
+        return 0
+
+    terminated = 0
+    for image in image_names:
+        try:
+            proc = subprocess.run(
+                ["taskkill", "/IM", image, "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if proc.returncode == 0:
+                terminated += 1
+        except Exception:
+            continue
+    return terminated
+
+
+def _browser_process_names(browser: str) -> list[str]:
+    name = _ALIASES.get(browser.lower().strip(), browser.lower().strip())
+    mapping = {
+        "chrome": ["chrome.exe"],
+        "edge": ["msedge.exe"],
+        "firefox": ["firefox.exe"],
+        "opera": ["opera.exe"],
+        "operagx": ["opera.exe"],
+        "brave": ["brave.exe"],
+        "vivaldi": ["vivaldi.exe"],
+    }
+    return mapping.get(name, [])
+
 _BROWSER_SPECS: dict[str, dict] = {
     "Windows": {
         "chrome":   {"engine": "chromium", "channel": "chrome",  "bins": []},
@@ -406,6 +468,70 @@ class _BrowserSession:
                 pass
         self._context = self._page = None
 
+    async def _ensure_primary_page(self):
+        if not self._context:
+            return
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        if not pages:
+            self._page = await self._context.new_page()
+            return
+
+        non_blank = [p for p in pages if p.url not in ("about:blank", "")]
+        self._page = non_blank[-1] if non_blank else pages[-1]
+
+    def _default_new_tab_url(self) -> Optional[str]:
+        name = _ALIASES.get(self.browser_name.lower().strip(), self.browser_name.lower().strip())
+        if name == "firefox":
+            return "about:newtab"
+        if name == "edge":
+            return "edge://newtab"
+        if name == "brave":
+            return "brave://new-tab-page"
+        if name == "vivaldi":
+            return "vivaldi://startpage"
+        if name in ("opera", "operagx"):
+            return "opera://startpage"
+        if name in ("chrome",):
+            return "chrome://newtab"
+        return None
+
+    async def _open_native_new_tab(self) -> Page:
+        """
+        Open a browser-native new tab (home/new-tab experience) when possible.
+        Fallback to Playwright new_page() if shortcut-based opening fails.
+        """
+        page = await self._get_page()
+        ctx = page.context
+        shortcut = "Meta+T" if _OS == "Darwin" else "Control+T"
+
+        try:
+            async with ctx.expect_page(timeout=4_000) as pinfo:
+                await page.bring_to_front()
+                await page.keyboard.press(shortcut)
+            new_page = await pinfo.value
+            try:
+                await new_page.wait_for_load_state("domcontentloaded", timeout=5_000)
+            except Exception:
+                pass
+            try:
+                await new_page.bring_to_front()
+            except Exception:
+                pass
+            return new_page
+        except Exception:
+            new_page = await ctx.new_page()
+            target = self._default_new_tab_url()
+            if target:
+                try:
+                    await new_page.goto(target, wait_until="domcontentloaded", timeout=8_000)
+                except Exception:
+                    pass
+            try:
+                await new_page.bring_to_front()
+            except Exception:
+                pass
+            return new_page
+
     async def _launch(self):
         """
         Tarayıcıyı gerçek kullanıcı profiliyle başlatır.
@@ -433,19 +559,14 @@ class _BrowserSession:
                 "slow_mo":     0,
                 "viewport":    None,
                 "no_viewport": True,
+                "color_scheme": "dark",
             }
             if exe:
                 kwargs["executable_path"] = exe
-            try:
-                self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-            except Exception as e:
-                print(f"[Browser] Firefox real profile failed ({e}), using JARVIS profile")
-                jarvis = str(Path.home() / ".jarvis_profiles" / "firefox_jarvis")
-                Path(jarvis).mkdir(parents=True, exist_ok=True)
-                self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
+            self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
 
             await asyncio.sleep(0.5)  
-            self._page = await self._context.new_page()
+            await self._ensure_primary_page()
             print(f"[Browser] ✅ Firefox launched")
             return
 
@@ -457,20 +578,46 @@ class _BrowserSession:
                 "slow_mo":     0,
                 "viewport":    None,
                 "no_viewport": True,
+                "color_scheme": "dark",
             }
             self._context = await engine_obj.launch_persistent_context(safari_profile, **kwargs)
             await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            await self._ensure_primary_page()
             print(f"[Browser] ✅ Safari launched")
             return
 
-        profile = _real_profile_dir(self.browser_name)
+        real_profile = _real_profile_dir(self.browser_name)
+        profile = real_profile
+
+        # For seamlessness, always use the real browser profile.
+        # If the profile is locked by an existing process, take over the process first.
+        if _OS == "Windows":
+            proc_names = _browser_process_names(self.browser_name)
+            if proc_names and _is_windows_process_running(proc_names):
+                print(
+                    f"[Browser] {self.browser_name} is already running; "
+                    "closing existing processes to take over real profile."
+                )
+                _terminate_windows_processes(proc_names)
+                for _ in range(20):
+                    if not _is_windows_process_running(proc_names):
+                        break
+                    await asyncio.sleep(0.2)
+                if _is_windows_process_running(proc_names):
+                    raise RuntimeError(
+                        f"Could not acquire real profile for {self.browser_name}; "
+                        "browser processes are still running."
+                    )
 
         kwargs = {
             "headless":    False,
             "slow_mo":     0,
             "viewport":    None,
             "no_viewport": True,
+            "color_scheme": "dark",
+            # Keep extensions enabled so browser-native new-tab/start pages
+            # continue to work (Playwright adds --disable-extensions by default).
+            "ignore_default_args": ["--disable-extensions"],
             "args": [
                 "--start-maximized",
                 "--disable-blink-features=AutomationControlled",
@@ -494,23 +641,11 @@ class _BrowserSession:
         try:
             self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
             await asyncio.sleep(0.5) 
-            self._page = await self._context.new_page()
+            await self._ensure_primary_page()
             print(f"[Browser] ✅ Launched [{label}] profile={profile}")
             return
         except Exception as e:
-            print(f"[Browser] ⚠️  Real profile failed for {label}: {e}")
-
-        jarvis_profile = str(Path.home() / ".jarvis_profiles" / self.browser_name)
-        Path(jarvis_profile).mkdir(parents=True, exist_ok=True)
-        print(f"[Browser] Retrying with JARVIS profile: {jarvis_profile}")
-
-        try:
-            self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
-            await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
-            print(f"[Browser] ✅ Launched [{label}] with JARVIS profile")
-        except Exception as e2:
-            raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
+            raise RuntimeError(f"Could not launch {self.browser_name} with real profile: {e}") from e
 
 
     async def _get_page(self) -> Page:
@@ -539,13 +674,33 @@ class _BrowserSession:
             return p.url
 
         result_url = await _do_goto(page)
+        if result_url and result_url not in ("about:blank", "", None):
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
 
         if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
             print(f"[Browser] Still blank after goto — retrying on new tab: {url}")
             try:
-                new_page   = await self._context.new_page()
+                old_page = page
+                new_page = await self._open_native_new_tab()
                 self._page = new_page
                 result_url = await _do_goto(new_page)
+                if result_url and result_url not in ("about:blank", "", None):
+                    try:
+                        await new_page.bring_to_front()
+                    except Exception:
+                        pass
+
+                # Cleanup: if retry succeeded and previous tab is untouched blank, close it.
+                if (
+                    old_page is not new_page
+                    and not old_page.is_closed()
+                    and old_page.url in ("about:blank", "")
+                    and result_url not in ("about:blank", "", None)
+                ):
+                    await old_page.close()
             except Exception as e:
                 print(f"[Browser] New-tab retry failed: {e}")
 
@@ -679,9 +834,7 @@ class _BrowserSession:
         return f"Could not find input: '{description}'"
 
     async def new_tab(self, url: str = "") -> str:
-        page = await self._get_page()
-        ctx  = page.context
-        new  = await ctx.new_page()
+        new = await self._open_native_new_tab()
         self._page = new
         if url:
             return await self.go_to(url)
@@ -765,6 +918,18 @@ class _SessionRegistry:
         self._active_browser = browser_name
         return f"Active browser → {browser_name}"
 
+    def warmup(self, browser_name: str | None = None) -> str:
+        """
+        Warm up Playwright + session thread without opening a browser window.
+        Actual browser launch is deferred until the first page action.
+        """
+        if not browser_name:
+            browser_name = self._active_browser or _detect_default_browser()
+        browser_name = _ALIASES.get(browser_name.lower().strip(), browser_name.lower().strip())
+        self._get_or_create(browser_name)
+        self._active_browser = browser_name
+        return f"Warmup ready for {browser_name} (no window opened)."
+
     def close_one(self, browser_name: str) -> str:
         with self._lock:
             sess = self._sessions.pop(browser_name, None)
@@ -825,6 +990,11 @@ def browser_control(
 
     if action == "close_all":
         result = _registry.close_all()
+        _log(player, result)
+        return result
+
+    if action == "warmup":
+        result = _registry.warmup(browser)
         _log(player, result)
         return result
 

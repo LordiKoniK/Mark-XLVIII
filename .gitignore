@@ -1,0 +1,9 @@
+# cache
+.pyc
+__pycache__/
+
+# not doxxing stuff
+config/certs/
+memory/__pycache__/
+memory/long_term.json
+config/api_keys.json

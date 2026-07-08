@@ -25,7 +25,10 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import sounddevice as sd
+from openwakeword.model import Model as _WakeWordModel
+from openwakeword.utils import download_models as _download_wakeword_models
 from google import genai
 from google.genai import types
 from ui import JarvisUI
@@ -69,6 +72,30 @@ SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
+WAKE_WORD            = "jarvis"   # bundled openwakeword pretrained model
+WAKE_THRESHOLD        = 0.3
+STOP_WAKE_WORD        = "stop"
+STOP_WAKE_THRESHOLD   = 0.5
+WAKE_RETRIGGER_COOLDOWN = 2.0          # seconds — ignore repeat triggers right after a wake
+WAKE_IDLE_TIMEOUT       = 8.0          # seconds of silence after wake before re-arming the gate
+POST_SPEECH_AWAKE_SECONDS = 5.0         # grace window for follow-up replies
+VOICE_DEBUG_LOGS          = False
+
+
+def _load_wake_model() -> tuple[_WakeWordModel, bool]:
+    """Load the local wake-word model, downloading weights on first run if needed."""
+    try:
+        return _WakeWordModel(wakeword_models=[WAKE_WORD, STOP_WAKE_WORD]), True
+    except Exception:
+        try:
+            # Pretrained model files not cached locally yet — fetch them once, then retry.
+            _download_wakeword_models()
+            return _WakeWordModel(wakeword_models=[WAKE_WORD, STOP_WAKE_WORD]), True
+        except Exception:
+            # Fallback: keep primary wake word active even if "stop" model is unavailable.
+            return _WakeWordModel(wakeword_models=[WAKE_WORD]), False
+
+
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
@@ -85,11 +112,25 @@ def _load_system_prompt() -> str:
         )
 
 _CTRL_RE = re.compile(r"<ctrl\d+>", re.IGNORECASE)
+_STOP_CMD_RE = re.compile(r"\bstop\b", re.IGNORECASE)
 
 def _clean_transcript(text: str) -> str:    
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
+
+
+def _wake_score(scores: dict, token: str) -> float:
+    """Return best wake score for model keys containing a token."""
+    t = token.lower().strip()
+    best = 0.0
+    for k, v in (scores or {}).items():
+        try:
+            if t in str(k).lower():
+                best = max(best, float(v))
+        except Exception:
+            continue
+    return best
 
 TOOL_DECLARATIONS = [
     {
@@ -254,7 +295,7 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"},
+                "action":      {"type": "STRING", "description": "warmup | go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"},
                 "browser":     {"type": "STRING", "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."},
                 "url":         {"type": "STRING", "description": "URL for go_to / new_tab action"},
                 "query":       {"type": "STRING", "description": "Search query for search action"},
@@ -527,6 +568,9 @@ class JarvisLive:
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        self._awake                = False   # True once "Jarvis" has been heard — gates mic → Gemini
+        self._wake_cooldown_until  = 0.0     # monotonic time before which new triggers are ignored
+        self._wake_model, self._stop_wake_enabled = _load_wake_model()
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
@@ -542,6 +586,35 @@ class JarvisLive:
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
+        self._browser_warmup_sent = False          # one-time no-window browser warmup
+        self._sleep_rearm_task: asyncio.Task | None = None
+        self._last_stop_debug_ts = 0.0
+
+    def _voice_debug(self, message: str) -> None:
+        if not VOICE_DEBUG_LOGS:
+            return
+        line = f"[VOICE-DBG] {message}"
+        print(line)
+        try:
+            self.ui.write_log(line)
+        except Exception:
+            pass
+
+    async def _warmup_browser_once(self) -> None:
+        """Pre-initialize browser_control without opening a browser window."""
+        if self._browser_warmup_sent:
+            return
+
+        self._browser_warmup_sent = True
+        loop = asyncio.get_event_loop()
+        try:
+            msg = await loop.run_in_executor(
+                None,
+                lambda: browser_control(parameters={"action": "warmup"}, player=self.ui),
+            )
+            self.ui.write_log(f"SYS: {msg}")
+        except Exception as e:
+            self.ui.write_log(f"SYS: Browser warmup skipped: {e}")
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -573,10 +646,69 @@ class JarvisLive:
         if value:
             self.ui.set_state("SPEAKING")
         elif not self.ui.muted:
+            self.ui.set_state("LISTENING" if self._awake else "STANDBY")
+
+    def _on_wake_detected(self) -> None:
+        """Called on the asyncio loop once the mic thread hears 'Jarvis'."""
+        self._cancel_sleep_rearm()
+        self.ui.write_log("SYS: Wake word heard — listening.")
+        if not self.ui.muted:
             self.ui.set_state("LISTENING")
+
+    def _cancel_sleep_rearm(self) -> None:
+        t = self._sleep_rearm_task
+        if t and not t.done():
+            t.cancel()
+            self._voice_debug("followup timer canceled")
+        self._sleep_rearm_task = None
+
+    def _schedule_sleep_rearm(self) -> None:
+        self._cancel_sleep_rearm()
+        self._sleep_rearm_task = asyncio.create_task(self._sleep_rearm_after_delay())
+        self._voice_debug(
+            f"followup timer scheduled for {POST_SPEECH_AWAKE_SECONDS:.1f}s"
+        )
+
+    async def _sleep_rearm_after_delay(self) -> None:
+        try:
+            await asyncio.sleep(POST_SPEECH_AWAKE_SECONDS)
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            # Keep awake if there is active interaction or fresh user speech.
+            if (
+                self._awake
+                and not speaking
+                and not self._pending_vision
+                and not self._vision_close_pending
+                and (time.monotonic() - self._last_user_speech) >= POST_SPEECH_AWAKE_SECONDS
+            ):
+                self._voice_debug("followup timer elapsed -> going STANDBY")
+                self._go_back_to_sleep()
+            else:
+                since = time.monotonic() - self._last_user_speech
+                self._voice_debug(
+                    "followup timer elapsed -> stay LISTENING "
+                    f"(awake={self._awake}, speaking={speaking}, "
+                    f"pending_vision={bool(self._pending_vision)}, "
+                    f"vision_close_pending={self._vision_close_pending}, "
+                    f"since_last_user={since:.2f}s)"
+                )
+        except asyncio.CancelledError:
+            self._voice_debug("followup timer task cancelled")
+            pass
+
+    def _go_back_to_sleep(self) -> None:
+        self._awake = False
+        if not self.ui.muted:
+            self.ui.set_state("STANDBY")
 
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+        self._cancel_sleep_rearm()
+        # Re-open the wake gate so user can continue speaking without saying
+        # the wake word again right after an interrupt.
+        self._awake = True
+        self._last_user_speech = time.monotonic()
         self._interrupted = True
         q = self.audio_in_queue
         if q:
@@ -823,12 +955,74 @@ class JarvisLive:
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
+            if self.ui.muted or self._phone_active:
+                return
+
+            # Always run the local wake-word model on every block so "Jarvis"
+            # can be heard even while the gate is shut.
+            pcm = indata.reshape(-1)
+            try:
+                scores = self._wake_model.predict(pcm)
+                jarvis_score = _wake_score(scores, WAKE_WORD)
+                stop_score = _wake_score(scores, STOP_WAKE_WORD)
+                heard_jarvis = jarvis_score >= WAKE_THRESHOLD
+                heard_stop = (
+                    self._stop_wake_enabled
+                    and stop_score >= STOP_WAKE_THRESHOLD
+                )
+            except Exception as e:
+                jarvis_score = 0.0
+                stop_score = 0.0
+                heard_jarvis = False
+                heard_stop = False
+                print(f"[JARVIS] ⚠️ Wake model error: {e}")
+
+            now = time.monotonic()
+            if jarvis_speaking and stop_score >= 0.10 and (now - self._last_stop_debug_ts) >= 0.5:
+                self._last_stop_debug_ts = now
+                self._voice_debug(
+                    f"stop score={stop_score:.3f} (threshold={STOP_WAKE_THRESHOLD:.3f}, model_enabled={self._stop_wake_enabled})"
+                )
+
+            if heard_stop and jarvis_speaking:
+                self._voice_debug("STOP wake-word matched -> interrupt")
+                loop.call_soon_threadsafe(self.interrupt)
+                return
+
+            if heard_jarvis and now >= self._wake_cooldown_until:
+                self._wake_cooldown_until = now + WAKE_RETRIGGER_COOLDOWN
+                self._last_user_speech    = now
+                if not self._awake:
+                    self._awake = True
+                    self._voice_debug(
+                        f"JARVIS wake matched (score={jarvis_score:.3f}) -> LISTENING"
+                    )
+                    loop.call_soon_threadsafe(self._on_wake_detected)
+
+            if jarvis_speaking:
+                # Always feed mic while speaking so transcript-based "stop"
+                # detection works regardless of wake-model availability.
+                if (now - self._last_stop_debug_ts) >= 1.0:
+                    self._last_stop_debug_ts = now
+                    self._voice_debug(
+                        "speaking: forwarding mic for stop-transcript detection"
+                    )
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
                 )
+                return
+
+            # Gate: only forward audio to Gemini once "Jarvis" has been heard.
+            if not self._awake:
+                return
+
+            data = indata.tobytes()
+            loop.call_soon_threadsafe(
+                self.out_queue.put_nowait,
+                {"data": data, "mime_type": "audio/pcm"}
+            )
 
         try:
             with sd.InputStream(
@@ -877,8 +1071,15 @@ class JarvisLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
+                                with self._speaking_lock:
+                                    speaking_now = self._is_speaking
+                                if speaking_now and _STOP_CMD_RE.search(txt):
+                                    self.ui.write_log("SYS: Voice interrupt detected.")
+                                    self.interrupt()
+                                    continue
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                self._cancel_sleep_rearm()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -969,6 +1170,9 @@ class JarvisLive:
             blocksize=CHUNK_SIZE,
         )
         stream.start()
+        last_audio_at = 0.0
+        speaking_latched = False
+        tail_silence_sec = 0.7
 
         try:
             while True:
@@ -978,15 +1182,27 @@ class JarvisLive:
                         timeout=0.1
                     )
                 except asyncio.TimeoutError:
-                    if (
-                        self._turn_done_event
-                        and self._turn_done_event.is_set()
-                        and self.audio_in_queue.empty()
-                    ):
+                    now = time.monotonic()
+                    # Only mark speech as finished after a short silence tail, so
+                    # follow-up timer starts from response END, not response START.
+                    if speaking_latched and (now - last_audio_at) >= tail_silence_sec and self.audio_in_queue.empty():
                         self.set_speaking(False)
-                        self._turn_done_event.clear()
+                        speaking_latched = False
+                        self._voice_debug(
+                            f"audio tail silence reached ({tail_silence_sec:.1f}s) -> speech ended"
+                        )
+                        if (
+                            self._turn_done_event
+                            and self._turn_done_event.is_set()
+                        ):
+                            self._turn_done_event.clear()
+                            if self._awake and not self._pending_vision and not self._vision_close_pending:
+                                self._schedule_sleep_rearm()
                     continue
+                self._cancel_sleep_rearm()
                 self.set_speaking(True)
+                speaking_latched = True
+                last_audio_at = time.monotonic()
                 try:
                     await asyncio.to_thread(stream.write, chunk)
                 except (RuntimeError, asyncio.CancelledError):
@@ -1126,6 +1342,16 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
 
+    async def _wake_idle_watchdog(self) -> None:
+        """If 'Jarvis' is heard but no command/response follows, re-close the gate."""
+        while True:
+            await asyncio.sleep(1.0)
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if self._awake and (not speaking) and (time.monotonic() - self._last_user_speech) > WAKE_IDLE_TIMEOUT:
+                print("[JARVIS] 💤 No command heard — re-arming wake word.")
+                self._go_back_to_sleep()
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
@@ -1197,6 +1423,9 @@ class JarvisLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        # Background-only warmup: prepares browser automation internals with no visible window.
+        await self._warmup_browser_once()
+
         while True:
             try:
                 print("[JARVIS] Connecting...")
@@ -1225,9 +1454,10 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._awake                = False   # require "Jarvis" again on every (re)connect
 
                     print("[JARVIS] Connected.")
-                    self.ui.set_state("LISTENING")
+                    self.ui.set_state("STANDBY")
                     self.ui.write_log("SYS: JARVIS online.")
 
                     if self._dashboard:
@@ -1239,6 +1469,7 @@ class JarvisLive:
                     tg.create_task(self._play_audio())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_proactive_mode())
+                    tg.create_task(self._wake_idle_watchdog())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
