@@ -55,6 +55,7 @@ from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
+from actions.light_control     import light_control
 
 
 def get_base_dir():
@@ -73,7 +74,7 @@ RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
 
 WAKE_WORD            = "jarvis"   # bundled openwakeword pretrained model
-WAKE_THRESHOLD        = 0.3
+WAKE_THRESHOLD        = 0.2
 STOP_WAKE_WORD        = "stop"
 STOP_WAKE_THRESHOLD   = 0.5
 WAKE_RETRIGGER_COOLDOWN = 2.0          # seconds — ignore repeat triggers right after a wake
@@ -425,6 +426,84 @@ TOOL_DECLARATIONS = [
             },
             "required": []
         }
+    },
+    {
+    "name": "light_control",
+    "description": (
+        "Controls Tuya smart lights. "
+        "Use this whenever the user wants to turn lights on or off, change brightness, "
+        "change colour, change colour temperature, or control the monitor light bar. "
+        "Always call this tool instead of describing what should happen. "
+        "For the monitor light bar, use section='white' for the downward-facing work light "
+        "and section='rgb' for the rear RGB backlight."
+    ),
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+
+            "device": {
+                "type": "STRING",
+                "enum": [
+                    "desk light",
+                    "left bulb",
+                    "right bulb",
+                    "room lights",
+                    "all lights",
+                    "lights"
+                ],
+                "description": (
+                    "Target light(s). "
+                    "'desk light' refers to the monitor light bar."
+                    "'room lights' and 'lights' control both room bulbs at once. "
+                    "'all lights' controls every light."
+                )
+            },
+
+            "action": {
+                "type": "STRING",
+                "enum": [
+                    "on",
+                    "off",
+                    "brightness",
+                    "temperature",
+                    "colour"
+                ],
+                "description": (
+                    "'on' or 'off' changes power. "
+                    "'brightness' expects a percentage in value. "
+                    "'temperature' expects a percentage in value (1000 corresponds to 100%). "
+                    "'colour' expects a colour name in value."
+                )
+            },
+
+            "section": {
+                "type": "STRING",
+                "enum": [
+                    "white",
+                    "rgb"
+                ],
+                "description": (
+                    "Only used for the desk light. "
+                    "'white' controls the downward work light. "
+                    "'rgb' controls the rear ambient light. "
+                    "Omit for normal bulbs."
+                )
+            },
+
+            "value": {
+                "type": "STRING",
+                "description": (
+                    "Required for brightness, temperature and colour actions. "
+                    "Examples: '25', '75', 'blue', 'purple', 'warm white'."
+                )
+            }
+
+        },
+        "required": [
+            "device",
+            "action"
+        ]
+    }
     },
     {
         "name": "flight_finder",
@@ -911,6 +990,17 @@ class JarvisLive:
 
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
+                result = r or "Done."
+                
+            elif name == "light_control":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: light_control(
+                        parameters=args,
+                        response=None,
+                        player=self.ui
+                    )
+                )
                 result = r or "Done."
 
             elif name == "system_status":
